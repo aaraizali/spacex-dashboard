@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import requests
@@ -9,57 +8,118 @@ from streamlit_folium import st_folium
 import matplotlib.pyplot as plt
 
 # =====================================================
-# LOAD & PREPARE DATA
+# CONFIGURATION
 # =====================================================
 
 API_BASE = "https://gateway.pipeworx.io/spacex/v4"
+REQUEST_TIMEOUT = 30
 
+
+# =====================================================
+# LOAD & PREPARE DATA
+# =====================================================
 
 @st.cache_data(ttl=300)
 def load_data():
+    session = requests.Session()
+    session.headers.update({"User-Agent": "SpaceX-Launch-Dashboard/1.0"})
+
     def fetch_json(url):
-        response = requests.get(url, timeout=30)
+        response = session.get(url, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
-        return response.json()
+
+        content_type = response.headers.get("content-type", "").lower()
+        if "json" not in content_type:
+            preview = response.text[:200].replace("\n", " ")
+            raise ValueError(
+                f"Expected JSON from {url}, but received "
+                f"'{content_type or 'unknown content type'}'. "
+                f"Response preview: {preview}"
+            )
+
+        try:
+            return response.json()
+        except requests.exceptions.JSONDecodeError as exc:
+            raise ValueError(f"The API returned invalid JSON for {url}.") from exc
 
     def get_records(payload, keys=()):
         if isinstance(payload, list):
             return payload
-
         if isinstance(payload, dict):
             for key in keys:
-                if isinstance(payload.get(key), list):
-                    return payload[key]
-
+                value = payload.get(key)
+                if isinstance(value, list):
+                    return value
+            # Some APIs wrap records in a "data" object.
+            nested = payload.get("data")
+            if isinstance(nested, list):
+                return nested
+            if isinstance(nested, dict):
+                for key in keys:
+                    value = nested.get(key)
+                    if isinstance(value, list):
+                        return value
         raise ValueError(
-            "Unexpected API response format. Please check the API."
+            "Unexpected API response format. The API did not return a list "
+            "of records. Check the endpoint and its response structure."
         )
+
+    def first_present(record, keys, default=None):
+        for key in keys:
+            value = record.get(key)
+            if value is not None:
+                return value
+        return default
+
+    def as_bool(value):
+        # Avoid treating strings such as "false" as True.
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "yes", "1", "success", "successful"}:
+                return True
+            if normalized in {"false", "no", "0", "failure", "failed", "unsuccessful"}:
+                return False
+        return None
+
+    def normalize_id(value):
+        if isinstance(value, dict):
+            return first_present(value, ("id", "_id", "name"))
+        return value
 
     try:
-        launches_payload = fetch_json(
-            f"{API_BASE}/launches/past?limit=1000"
-        )
-        rockets_payload = fetch_json(f"{API_BASE}/rockets")
+        # Try the common list endpoint first. Fall back to the past-launch
+        # endpoint if the gateway does not support /launches.
+        try:
+            launches_payload = fetch_json(f"{API_BASE}/launches")
+            launches = get_records(
+                launches_payload, ("launches", "docs", "results", "data")
+            )
+        except (requests.exceptions.RequestException, ValueError):
+            launches_payload = fetch_json(
+                f"{API_BASE}/launches/past?limit=1000"
+            )
+            launches = get_records(
+                launches_payload, ("launches", "docs", "results", "data")
+            )
 
-        launches = get_records(
-            launches_payload, ("launches", "docs", "results")
-        )
+        rockets_payload = fetch_json(f"{API_BASE}/rockets")
         rockets = get_records(
-            rockets_payload, ("rockets", "docs", "results")
+            rockets_payload, ("rockets", "docs", "results", "data")
         )
 
         rocket_map = {}
         for rocket in rockets:
-            if isinstance(rocket, dict):
-                rocket_name = rocket.get("name", "Unknown")
-                rocket_id = rocket.get(
-                    "id", rocket.get("_id", rocket_name)
-                )
-                rocket_map[str(rocket_id)] = rocket_name
-                rocket_map[rocket_name] = rocket_name
+            if not isinstance(rocket, dict):
+                continue
+            rocket_name = first_present(rocket, ("name", "rocket_name"), "Unknown")
+            rocket_id = first_present(rocket, ("id", "_id"), rocket_name)
+            rocket_map[str(rocket_id)] = str(rocket_name)
+            rocket_map[str(rocket_name)] = str(rocket_name)
 
-        # Approximate coordinates for recognized SpaceX launch sites.
-        # If the API does not identify a site, its coordinates stay empty.
         pad_locations = {
             "lc-39a": (28.6082, -80.6040),
             "39a": (28.6082, -80.6040),
@@ -73,123 +133,117 @@ def load_data():
         }
 
         def find_pad_coordinates(pad_name):
-            normalized = str(pad_name).lower()
-
+            normalized = str(pad_name or "").lower()
             for key, coordinates in pad_locations.items():
                 if key in normalized:
                     return coordinates
-
             return None, None
 
         data = []
+        skipped_no_outcome = 0
+        skipped_bad_date = 0
 
         for launch in launches:
             if not isinstance(launch, dict):
                 continue
 
-            success = launch.get("success")
-
-            # Only train on confirmed outcomes.
+            success_value = first_present(
+                launch, ("success", "successful", "launch_success")
+            )
+            success = as_bool(success_value)
             if success is None:
+                skipped_no_outcome += 1
                 continue
 
-            date_utc = launch.get(
-                "date_utc", launch.get("date")
+            date_value = first_present(launch, ("date_utc", "date", "date_local"))
+            if not date_value:
+                skipped_bad_date += 1
+                continue
+
+            launch_date = pd.to_datetime(date_value, utc=True, errors="coerce")
+            if pd.isna(launch_date):
+                skipped_bad_date += 1
+                continue
+
+            rocket_value = first_present(
+                launch, ("rocket", "rocket_id", "rocket_name"), "Unknown"
             )
-
-            if not date_utc:
-                continue
-
-            try:
-                launch_date = pd.to_datetime(
-                    date_utc, utc=True, errors="raise"
-                )
-                launch_year = int(launch_date.year)
-            except (ValueError, TypeError):
-                continue
-
-            rocket_value = launch.get("rocket", "Unknown")
-
-            if isinstance(rocket_value, dict):
-                rocket_value = rocket_value.get(
-                    "name",
-                    rocket_value.get(
-                        "id", rocket_value.get("_id", "Unknown")
-                    ),
-                )
-
+            rocket_value = normalize_id(rocket_value)
             rocket_value = str(rocket_value or "Unknown")
-            rocket_name = rocket_map.get(
-                rocket_value, rocket_value
-            )
+            rocket_name = rocket_map.get(rocket_value, rocket_value)
 
-            pad = launch.get(
-                "launchpad", launch.get("pad", "Unknown")
-            )
-
+            pad = first_present(launch, ("launchpad", "pad", "launch_site"), "Unknown")
+            latitude = longitude = None
             if isinstance(pad, dict):
-                pad_name = pad.get(
-                    "name", pad.get("location", "Unknown")
+                pad_name = first_present(
+                    pad, ("name", "full_name", "location", "id", "_id"), "Unknown"
                 )
-                latitude = pad.get("latitude")
-                longitude = pad.get("longitude")
-
-                if latitude is None or longitude is None:
-                    latitude, longitude = find_pad_coordinates(
-                        pad_name
-                    )
+                latitude = first_present(pad, ("latitude", "lat"))
+                longitude = first_present(pad, ("longitude", "long", "lng"))
             else:
                 pad_name = str(pad or "Unknown")
-                latitude, longitude = find_pad_coordinates(
-                    pad_name
-                )
 
-            # Handle numeric coordinates if supplied by the API.
+            if latitude is None or longitude is None:
+                guessed_lat, guessed_lon = find_pad_coordinates(pad_name)
+                latitude = latitude if latitude is not None else guessed_lat
+                longitude = longitude if longitude is not None else guessed_lon
+
             try:
-                latitude = (
-                    float(latitude) if latitude is not None else None
-                )
-                longitude = (
-                    float(longitude) if longitude is not None else None
-                )
+                latitude = float(latitude) if latitude is not None else None
+                longitude = float(longitude) if longitude is not None else None
             except (TypeError, ValueError):
-                latitude, longitude = None, None
+                latitude = longitude = None
 
             data.append({
-                "flight_number": launch.get(
-                    "flight_number", launch.get("id", 0)
+                "flight_number": first_present(
+                    launch, ("flight_number", "flightNumber", "id"), 0
                 ),
-                "name": launch.get("name", "Unknown"),
-                "date_utc": str(date_utc),
-                "launch_year": launch_year,
+                "name": first_present(launch, ("name", "mission_name"), "Unknown"),
+                "date_utc": str(date_value),
+                "launch_year": int(launch_date.year),
                 "rocket_id": rocket_name,
                 "rocket_name": rocket_name,
-                "launchpad_name": pad_name,
+                "launchpad_name": str(pad_name),
                 "latitude": latitude,
                 "longitude": longitude,
-                "success": int(bool(success)),
-                "details": launch.get("details") or "",
+                "success": int(success),
+                "details": first_present(launch, ("details", "description"), "") or "",
             })
 
         df = pd.DataFrame(data)
-
         if df.empty:
             raise ValueError(
-                "No launches with confirmed outcomes were returned."
+                "No launches with confirmed outcomes were returned. "
+                f"API records received: {len(launches)}; "
+                f"records without a recognized outcome: {skipped_no_outcome}; "
+                f"records with missing/invalid dates: {skipped_bad_date}."
             )
 
+        # Keep only usable rocket labels.
+        df["rocket_id"] = df["rocket_id"].fillna("Unknown").astype(str)
+        df["rocket_name"] = df["rocket_name"].fillna("Unknown").astype(str)
+
+        # Debug details appear in the app so the returned data can be checked.
+        st.sidebar.caption(
+            f"Data loaded: {len(df)} launches | "
+            f"{df['rocket_id'].nunique()} rocket labels | "
+            f"{int((df['success'] == 1).sum())} successful | "
+            f"{int((df['success'] == 0).sum())} unsuccessful"
+        )
         return df
 
     except requests.exceptions.RequestException as error:
         st.error(f"Unable to connect to the SpaceX data API: {error}")
-        st.info("Please try again later if the data service is unavailable.")
+        st.info(
+            "The API service may be unavailable, or the gateway URL may have changed. "
+            "Check the API endpoint and try again."
+        )
         st.stop()
-
     except (ValueError, TypeError, KeyError) as error:
         st.error(f"Unable to process SpaceX data: {error}")
         st.info(
-            "The API response may have changed. "
-            "Check the response format before retrying."
+            "The API response may use a different format or field names. "
+            "The error above includes details to help diagnose it."
         )
         st.stop()
 
@@ -203,22 +257,20 @@ df = load_data()
 if df["rocket_id"].nunique() < 1 or df["success"].nunique() < 2:
     st.error(
         "The prediction model needs launches from at least one rocket "
-        "and both successful and unsuccessful outcomes."
+        "and both successful and unsuccessful outcomes. "
+        f"Currently loaded: {len(df)} launches, "
+        f"{int((df['success'] == 1).sum())} successful and "
+        f"{int((df['success'] == 0).sum())} unsuccessful."
     )
     st.stop()
 
 le = LabelEncoder()
-df["encoded_rocket"] = le.fit_transform(
-    df["rocket_id"].astype(str)
-)
+df["encoded_rocket"] = le.fit_transform(df["rocket_id"].astype(str))
 
 X = df[["launch_year", "encoded_rocket"]]
 y = df["success"]
 
-model = RandomForestClassifier(
-    n_estimators=100,
-    random_state=42
-)
+model = RandomForestClassifier(n_estimators=100, random_state=42)
 model.fit(X, y)
 
 # =====================================================
@@ -227,24 +279,15 @@ model.fit(X, y)
 
 st.sidebar.title("🚀 SpaceX Launch Dashboard")
 st.sidebar.write("Filters & Prediction")
-
 mode = st.sidebar.radio("Theme Mode", ["Light", "Dark"])
 
 if mode == "Dark":
     st.markdown(
         """
         <style>
-        .stApp {
-            background-color: #121212 !important;
-            color: #ffffff !important;
-        }
-        [data-testid="stSidebar"] {
-            background-color: #1c1c1c !important;
-        }
-        .stButton > button {
-            background-color: #4caf50;
-            color: white;
-        }
+        .stApp { background-color: #121212 !important; color: #ffffff !important; }
+        [data-testid="stSidebar"] { background-color: #1c1c1c !important; }
+        .stButton > button { background-color: #4caf50; color: white; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -253,14 +296,8 @@ else:
     st.markdown(
         """
         <style>
-        .stApp {
-            background-color: white !important;
-            color: black !important;
-        }
-        .stButton > button {
-            background-color: #4caf50;
-            color: white;
-        }
+        .stApp { background-color: white !important; color: black !important; }
+        .stButton > button { background-color: #4caf50; color: white; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -271,22 +308,13 @@ else:
 # =====================================================
 
 years = sorted(df["launch_year"].unique().tolist())
-
-selected_year = st.sidebar.selectbox(
-    "Filter launches by Year", years
-)
+selected_year = st.sidebar.selectbox("Filter launches by Year", years)
 
 rocket_options = (
-    df[["rocket_id", "rocket_name"]]
-    .drop_duplicates()
-    .reset_index(drop=True)
+    df[["rocket_id", "rocket_name"]].drop_duplicates().reset_index(drop=True)
 )
-
 rocket_names = rocket_options["rocket_name"].tolist()
-
-rocket_name = st.sidebar.selectbox(
-    "Select Rocket for Prediction", rocket_names
-)
+rocket_name = st.sidebar.selectbox("Select Rocket for Prediction", rocket_names)
 
 input_year = st.sidebar.number_input(
     "Enter Launch Year (Prediction)",
@@ -294,10 +322,8 @@ input_year = st.sidebar.number_input(
     max_value=2030,
     value=2026,
 )
-
 input_month = st.sidebar.slider("Launch Month", 1, 12, 6)
 input_day = st.sidebar.slider("Launch Day", 1, 31, 15)
-
 predict_btn = st.sidebar.button("Predict Success")
 
 # =====================================================
@@ -312,53 +338,33 @@ st.write(
 
 filtered = df[df["launch_year"] == selected_year]
 
-# --- Launch Outcomes ---
 st.subheader(f"Launch Outcomes in {selected_year}")
-
 success_counts = (
-    filtered["success"]
-    .value_counts()
-    .reindex([1, 0], fill_value=0)
+    filtered["success"].value_counts().reindex([1, 0], fill_value=0)
 )
 success_counts.index = ["Success", "Failure"]
-
 st.bar_chart(success_counts)
 
-# --- Launch Trends ---
 st.subheader("📈 Launch Trends Over Years")
-
 launches_per_year = df.groupby("launch_year").size()
 success_rate_per_year = df.groupby("launch_year")["success"].mean()
 
 fig, ax1 = plt.subplots(figsize=(10, 4))
-
 ax1.set_xlabel("Year")
 ax1.set_ylabel("Number of Launches")
-ax1.plot(
-    launches_per_year.index,
-    launches_per_year.values,
-    marker="o",
-)
+ax1.plot(launches_per_year.index, launches_per_year.values, marker="o")
 
 ax2 = ax1.twinx()
 ax2.set_ylabel("Success Rate")
-ax2.plot(
-    success_rate_per_year.index,
-    success_rate_per_year.values,
-    marker="x",
-)
+ax2.plot(success_rate_per_year.index, success_rate_per_year.values, marker="x")
 ax2.set_ylim(0, 1)
 
 fig.tight_layout()
 st.pyplot(fig)
 plt.close(fig)
 
-# --- Launch Sites Map ---
 st.subheader("🌍 Launch Sites Map")
-
-map_data = filtered.dropna(
-    subset=["latitude", "longitude"]
-)
+map_data = filtered.dropna(subset=["latitude", "longitude"])
 
 if not map_data.empty:
     m = folium.Map(
@@ -368,16 +374,12 @@ if not map_data.empty:
         ],
         zoom_start=3,
     )
-
     for _, row in map_data.iterrows():
         popup_text = (
             f"{row['name']} ({row['launchpad_name']})"
-            f"<br>Success: "
-            f"{'Yes' if row['success'] == 1 else 'No'}"
+            f"<br>Success: {'Yes' if row['success'] == 1 else 'No'}"
         )
-
         color = "green" if row["success"] == 1 else "red"
-
         folium.CircleMarker(
             location=[row["latitude"], row["longitude"]],
             radius=6,
@@ -386,21 +388,15 @@ if not map_data.empty:
             fill=True,
             fill_color=color,
         ).add_to(m)
-
     st_folium(m, width=700, height=450)
 else:
-    st.info(
-        "Launchpad coordinates are unavailable for the selected year."
-    )
+    st.info("Launchpad coordinates are unavailable for the selected year.")
 
-# --- Feature Importance ---
 st.subheader("🧠 Model Feature Importance")
-
 importance_df = pd.DataFrame({
     "Feature": X.columns,
     "Importance": model.feature_importances_,
 }).sort_values(by="Importance", ascending=False)
-
 st.bar_chart(importance_df.set_index("Feature"))
 
 # =====================================================
@@ -409,20 +405,14 @@ st.bar_chart(importance_df.set_index("Feature"))
 
 if predict_btn:
     encoded_id = le.transform([rocket_name])[0]
-
     input_data = pd.DataFrame(
         [[input_year, encoded_id]],
         columns=["launch_year", "encoded_rocket"],
     )
-
     probabilities = model.predict_proba(input_data)[0]
     success_class_index = list(model.classes_).index(1)
     probability = probabilities[success_class_index]
-
-    st.success(
-        f"Predicted Success Probability: {probability:.2%}"
-    )
-
+    st.success(f"Predicted Success Probability: {probability:.2%}")
     st.caption(
         "This is a model estimate based on historical launch outcomes, "
         "not a guarantee. The selected month and day are not model inputs."
